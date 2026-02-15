@@ -1,4 +1,4 @@
-# NYC Taxi Data Pipeline
+# CabStream ETL
 
 This project implements an end-to-end data pipeline for analyzing NYC Yellow Taxi Trip data, including data ingestion, processing, transformation, and visualization.
 
