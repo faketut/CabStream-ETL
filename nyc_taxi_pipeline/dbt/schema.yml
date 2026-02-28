@@ -7,6 +7,16 @@ sources:
     tables:
       - name: yellow_tripdata
         description: "NYC Yellow Taxi Trip Data"
+        columns:
+          - name: VendorID
+            tests:
+              - not_null
+          - name: tpep_pickup_datetime
+            tests:
+              - not_null
+          - name: PULocationID
+            tests:
+              - not_null
 
 models:
   - name: dim_zones
