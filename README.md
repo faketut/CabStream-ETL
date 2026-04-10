@@ -289,13 +289,3 @@ Future improvements could include:
 - CI/CD pipeline for automated deployment
 - Cost optimization of BigQuery queries
 
-## Troubleshooting
-
-- **Terraform errors**: Check GCP permissions and API enablement
-- **Airflow connection issues**: Verify network settings and service account permissions
-- **dbt failures**: Check BigQuery table access and schema compatibility
-- **Dashboard connection**: Ensure BigQuery dataset sharing is properly configured
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
