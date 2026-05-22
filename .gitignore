@@ -9,3 +9,4 @@ __pycache__/
 .terraform.lock.hcl
 
 /tmp/
+.DS_Store

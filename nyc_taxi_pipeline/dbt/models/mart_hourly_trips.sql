@@ -5,28 +5,26 @@
       "data_type": "date",
       "granularity": "day"
     },
-    cluster_by = ["hour_of_day"]
+    cluster_by = ["pickup_hour"]
 )}}
 
--- Hourly aggregation for time-of-day analysis
+-- Hourly aggregation; reads only from fact_trips (no dim_datetime join needed).
 SELECT
-    dt.year,
-    dt.month,
-    dt.day,
-    dt.hour AS hour_of_day,
-    DATE(dt.datetime_timestamp) AS pickup_date,
-    COUNT(*) AS trip_count,
-    AVG(t.trip_distance) AS avg_distance,
-    AVG(t.fare_amount) AS avg_fare,
-    AVG(t.tip_amount) AS avg_tip,
-    AVG(t.total_amount) AS avg_total,
-    SUM(t.total_amount) AS total_revenue,
-    dt.is_weekend
-FROM
-    {{ ref('fact_trips') }} t
-JOIN
-    {{ ref('dim_datetime') }} dt ON t.pickup_datetime_id = dt.datetime_id
-GROUP BY
-    dt.year, dt.month, dt.day, dt.hour, pickup_date, dt.is_weekend
-ORDER BY
-    dt.year, dt.month, dt.day, dt.hour
+    pickup_date,
+    EXTRACT(YEAR  FROM pickup_date) AS year,
+    EXTRACT(MONTH FROM pickup_date) AS month,
+    EXTRACT(DAY   FROM pickup_date) AS day,
+    pickup_hour,
+    is_weekend,
+    COUNT(*)            AS trip_count,
+    AVG(trip_distance)  AS avg_distance,
+    AVG(fare_amount)    AS avg_fare,
+    AVG(tip_amount)     AS avg_tip,
+    AVG(total_amount)   AS avg_total,
+    SUM(total_amount)   AS total_revenue
+FROM {{ ref('fact_trips') }}
+WHERE pickup_date >= DATE_SUB(
+    CURRENT_DATE(), INTERVAL {{ var('lookback_days', 90) }} DAY
+)
+GROUP BY pickup_date, pickup_hour, is_weekend
+ORDER BY pickup_date, pickup_hour

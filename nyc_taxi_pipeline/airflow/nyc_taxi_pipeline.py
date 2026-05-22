@@ -1,198 +1,207 @@
+"""NYC Yellow Taxi data pipeline.
+
+Triggered manually (or via API) with optional params:
+    {"months": ["2023-01", "2023-02"]}  # list of YYYY-MM strings
+
+Static configuration (PROJECT_ID, BUCKET_NAME, BIGQUERY_DATASET) is read
+from environment variables so deployments to different environments do
+not require code changes.
+"""
+from __future__ import annotations
+
 import os
+import shutil
 from datetime import datetime, timedelta
 
+import requests
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.providers.google.cloud.transfers.local_to_gcs import LocalFilesystemToGCSOperator
-from airflow.providers.google.cloud.operators.bigquery import BigQueryCreateExternalTableOperator
-from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.providers.google.cloud.operators.bigquery import (
+    BigQueryCreateExternalTableOperator,
+    BigQueryInsertJobOperator,
+)
+from airflow.providers.google.cloud.transfers.local_to_gcs import (
+    LocalFilesystemToGCSOperator,
+)
 
-import requests
-import pandas as pd
-from google.cloud import storage
-from google.cloud import bigquery
-
+# ---------------------------------------------------------------------------
 # Configuration
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "nyc-taxi-project-12345")
-BUCKET_NAME = f"{PROJECT_ID}_data_lake"
-BIGQUERY_DATASET = "nyc_taxi_data"
-DOWNLOAD_DIR = "/tmp/nyc_taxi_data"
+# ---------------------------------------------------------------------------
+PROJECT_ID = os.environ["GCP_PROJECT_ID"]  # fail fast if unset
+BUCKET_NAME = os.environ.get("CABSTREAM_BUCKET", f"{PROJECT_ID}_data_lake")
+BIGQUERY_DATASET = os.environ.get("CABSTREAM_DATASET", "nyc_taxi_data")
+DEFAULT_MONTHS = ["2023-01", "2023-02", "2023-03"]
+DOWNLOAD_ROOT = "/tmp/nyc_taxi_data"
 
-# Define months to download (for the MVP, we'll use 3 months of data)
-MONTHS = ['2023-01', '2023-02', '2023-03']
+DOWNLOAD_URL = (
+    "https://d37ci6vzurychx.cloudfront.net/trip-data/"
+    "yellow_tripdata_{year}-{month}.parquet"
+)
 
-# Default arguments for DAG
+EXTERNAL_TABLE_SCHEMA = [
+    {"name": "VendorID", "type": "INTEGER"},
+    {"name": "tpep_pickup_datetime", "type": "TIMESTAMP"},
+    {"name": "tpep_dropoff_datetime", "type": "TIMESTAMP"},
+    {"name": "passenger_count", "type": "INTEGER"},
+    {"name": "trip_distance", "type": "FLOAT"},
+    {"name": "RatecodeID", "type": "INTEGER"},
+    {"name": "store_and_fwd_flag", "type": "STRING"},
+    {"name": "PULocationID", "type": "INTEGER"},
+    {"name": "DOLocationID", "type": "INTEGER"},
+    {"name": "payment_type", "type": "INTEGER"},
+    {"name": "fare_amount", "type": "FLOAT"},
+    {"name": "extra", "type": "FLOAT"},
+    {"name": "mta_tax", "type": "FLOAT"},
+    {"name": "tip_amount", "type": "FLOAT"},
+    {"name": "tolls_amount", "type": "FLOAT"},
+    {"name": "improvement_surcharge", "type": "FLOAT"},
+    {"name": "total_amount", "type": "FLOAT"},
+    {"name": "congestion_surcharge", "type": "FLOAT"},
+]
+
+CREATE_OPTIMIZED_SQL = f"""
+CREATE OR REPLACE TABLE `{PROJECT_ID}.{BIGQUERY_DATASET}.yellow_tripdata`
+PARTITION BY DATE(tpep_pickup_datetime)
+CLUSTER BY PULocationID AS
+SELECT * FROM `{PROJECT_ID}.{BIGQUERY_DATASET}.external_yellow_tripdata`
+"""
+
 default_args = {
-    'owner': 'airflow',
-    'depends_on_past': False,
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
+    "owner": "airflow",
+    "depends_on_past": False,
+    "email_on_failure": False,
+    "email_on_retry": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
 }
 
-# Define DAG
-dag = DAG(
-    'nyc_taxi_pipeline',
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _year_month(month: str) -> tuple[str, str]:
+    """Split a 'YYYY-MM' string into ('YYYY', 'MM'); raises on bad input."""
+    parts = month.split("-", 1)
+    if len(parts) != 2 or len(parts[0]) != 4 or len(parts[1]) != 2:
+        raise ValueError(f"Expected YYYY-MM, got {month!r}")
+    return parts[0], parts[1]
+
+
+def _run_dir(run_id: str) -> str:
+    """Per-run download directory, isolates concurrent runs / retries."""
+    safe = run_id.replace(":", "-").replace("+", "-")
+    return os.path.join(DOWNLOAD_ROOT, safe)
+
+
+# ---------------------------------------------------------------------------
+# Task callables
+# ---------------------------------------------------------------------------
+def download_taxi_data(**context) -> str:
+    """Stream-download NYC Taxi parquets for each requested month."""
+    params = context.get("params") or {}
+    months = params.get("months") or DEFAULT_MONTHS
+    target_dir = _run_dir(context["run_id"])
+    os.makedirs(target_dir, exist_ok=True)
+
+    for month in months:
+        year, month_num = _year_month(month)
+        url = DOWNLOAD_URL.format(year=year, month=month_num)
+        local_path = os.path.join(target_dir, f"yellow_tripdata_{year}-{month_num}.parquet")
+
+        with requests.get(url, stream=True, timeout=(10, 120)) as r:
+            r.raise_for_status()
+            with open(local_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+        size = os.path.getsize(local_path)
+        if size < 1_000_000:
+            raise RuntimeError(f"Suspiciously small download: {local_path} ({size} bytes)")
+        print(f"Downloaded {local_path} ({size:,} bytes)")
+
+    return target_dir
+
+
+def cleanup_download_dir(**context) -> None:
+    """Remove the per-run download dir; runs on all_done so it cleans on failure too."""
+    target_dir = _run_dir(context["run_id"])
+    shutil.rmtree(target_dir, ignore_errors=True)
+    print(f"Cleaned {target_dir}")
+
+
+def _external_source_uris(months: list[str]) -> list[str]:
+    return [
+        f"gs://{BUCKET_NAME}/yellow_tripdata/yellow_tripdata_{m}.parquet" for m in months
+    ]
+
+
+EXTERNAL_TABLE_RESOURCE = {
+    "tableReference": {
+        "projectId": PROJECT_ID,
+        "datasetId": BIGQUERY_DATASET,
+        "tableId": "external_yellow_tripdata",
+    },
+    "externalDataConfiguration": {
+        "sourceFormat": "PARQUET",
+        "sourceUris": _external_source_uris(DEFAULT_MONTHS),
+        "schema": {"fields": EXTERNAL_TABLE_SCHEMA},
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# DAG
+# ---------------------------------------------------------------------------
+with DAG(
+    dag_id="nyc_taxi_pipeline",
     default_args=default_args,
-    description='NYC Taxi Data Pipeline',
-    schedule_interval=timedelta(days=1),  # Daily
+    description="NYC Yellow Taxi batch ingestion (manual / backfill trigger).",
+    schedule_interval=None,  # manual trigger; pass `months` via params
     start_date=datetime(2023, 1, 1),
     catchup=False,
-    tags=['nyc', 'taxi', 'data-pipeline'],
-)
+    tags=["nyc", "taxi", "data-pipeline"],
+    params={"months": DEFAULT_MONTHS},
+) as dag:
 
-# Task to download the NYC Taxi data
-def download_taxi_data(**kwargs):
-    """Download NYC Taxi data for specified months"""
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    
-    for month in MONTHS:
-        year = month.split('-')[0]
-        month_num = month.split('-')[1]
-        url = f"https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_{year}-{month_num}.parquet"
-        local_path = f"{DOWNLOAD_DIR}/yellow_tripdata_{year}-{month_num}.parquet"
-        
-        # Download the file
-        response = requests.get(url)
-        with open(local_path, 'wb') as f:
-            f.write(response.content)
-        
-        print(f"Downloaded {local_path}")
-    
-    return DOWNLOAD_DIR
+    download_task = PythonOperator(
+        task_id="download_taxi_data",
+        python_callable=download_taxi_data,
+    )
 
-# Task to perform basic validation and preprocessing
-def preprocess_data(**kwargs):
-    """Basic validation and preprocessing of downloaded data"""
-    ti = kwargs['ti']
-    download_dir = ti.xcom_pull(task_ids='download_taxi_data')
-    
-    for month in MONTHS:
-        year = month.split('-')[0]
-        month_num = month.split('-')[1]
-        file_path = f"{download_dir}/yellow_tripdata_{year}-{month_num}.parquet"
-        
-        # Load the data
-        df = pd.read_parquet(file_path)
-        
-        # Basic validation
-        print(f"File {file_path}: {len(df)} rows")
-        
-        # Simple preprocessing (you might want to do more in a real scenario)
-        # Remove rows with negative fare amounts
-        df = df[df['fare_amount'] >= 0]
-        
-        # Save the preprocessed data
-        processed_path = f"{download_dir}/processed_yellow_tripdata_{year}-{month_num}.parquet"
-        df.to_parquet(processed_path, index=False)
-        
-        print(f"Preprocessed {processed_path}")
-    
-    return download_dir
+    upload_to_gcs_task = LocalFilesystemToGCSOperator(
+        task_id="upload_to_gcs",
+        src=(
+            f"{DOWNLOAD_ROOT}/"
+            "{{ run_id | replace(':','-') | replace('+','-') }}/"
+            "yellow_tripdata_*.parquet"
+        ),
+        dst="yellow_tripdata/",
+        bucket=BUCKET_NAME,
+    )
 
-# Task to create BigQuery external table
-def create_external_table(**kwargs):
-    """Create BigQuery external table pointing to GCS data"""
-    client = bigquery.Client(project=PROJECT_ID)
-    
-    dataset_ref = client.dataset(BIGQUERY_DATASET)
-    table_ref = dataset_ref.table("external_yellow_tripdata")
-    
-    # Define schema (simplified for MVP)
-    schema = [
-        bigquery.SchemaField("VendorID", "INTEGER"),
-        bigquery.SchemaField("tpep_pickup_datetime", "TIMESTAMP"),
-        bigquery.SchemaField("tpep_dropoff_datetime", "TIMESTAMP"),
-        bigquery.SchemaField("passenger_count", "INTEGER"),
-        bigquery.SchemaField("trip_distance", "FLOAT"),
-        bigquery.SchemaField("RatecodeID", "INTEGER"),
-        bigquery.SchemaField("store_and_fwd_flag", "STRING"),
-        bigquery.SchemaField("PULocationID", "INTEGER"),
-        bigquery.SchemaField("DOLocationID", "INTEGER"),
-        bigquery.SchemaField("payment_type", "INTEGER"),
-        bigquery.SchemaField("fare_amount", "FLOAT"),
-        bigquery.SchemaField("extra", "FLOAT"),
-        bigquery.SchemaField("mta_tax", "FLOAT"),
-        bigquery.SchemaField("tip_amount", "FLOAT"),
-        bigquery.SchemaField("tolls_amount", "FLOAT"),
-        bigquery.SchemaField("improvement_surcharge", "FLOAT"),
-        bigquery.SchemaField("total_amount", "FLOAT"),
-        bigquery.SchemaField("congestion_surcharge", "FLOAT"),
-    ]
-    
-    # Create external table config
-    external_config = bigquery.ExternalConfig("PARQUET")
-    
-    # Set the source URIs
-    external_config.source_uris = [
-        f"gs://{BUCKET_NAME}/yellow_tripdata/processed_yellow_tripdata_{month}.parquet" 
-        for month in MONTHS
-    ]
-    
-    # Create the table
-    table = bigquery.Table(table_ref, schema=schema)
-    table.external_data_configuration = external_config
-    
-    # Create the table
-    client.create_table(table, exists_ok=True)
-    
-    print(f"Created external table {PROJECT_ID}.{BIGQUERY_DATASET}.external_yellow_tripdata")
+    create_external_table_task = BigQueryCreateExternalTableOperator(
+        task_id="create_external_table",
+        table_resource=EXTERNAL_TABLE_RESOURCE,
+    )
 
-# Task to create the optimized BigQuery table
-def create_optimized_table(**kwargs):
-    """Create an optimized BigQuery table from the external table"""
-    client = bigquery.Client(project=PROJECT_ID)
-    
-    # SQL to create an optimized table (partitioned and clustered)
-    sql = f"""
-    CREATE OR REPLACE TABLE `{PROJECT_ID}.{BIGQUERY_DATASET}.yellow_tripdata`
-    PARTITION BY DATE(tpep_pickup_datetime)
-    CLUSTER BY PULocationID AS
-    SELECT * FROM `{PROJECT_ID}.{BIGQUERY_DATASET}.external_yellow_tripdata`
-    """
-    
-    # Execute the query
-    job = client.query(sql)
-    job.result()  # Wait for the job to complete
-    
-    print(f"Created optimized table {PROJECT_ID}.{BIGQUERY_DATASET}.yellow_tripdata")
+    create_optimized_table_task = BigQueryInsertJobOperator(
+        task_id="create_optimized_table",
+        configuration={
+            "query": {"query": CREATE_OPTIMIZED_SQL, "useLegacySql": False}
+        },
+    )
 
-# Define tasks
-download_task = PythonOperator(
-    task_id='download_taxi_data',
-    python_callable=download_taxi_data,
-    dag=dag,
-)
+    cleanup_task = PythonOperator(
+        task_id="cleanup_download_dir",
+        python_callable=cleanup_download_dir,
+        trigger_rule="all_done",
+    )
 
-preprocess_task = PythonOperator(
-    task_id='preprocess_data',
-    python_callable=preprocess_data,
-    dag=dag,
-)
-
-# Task to upload data to GCS
-upload_to_gcs_task = LocalFilesystemToGCSOperator(
-    task_id='upload_to_gcs',
-    src=f"{DOWNLOAD_DIR}/processed_*.parquet",
-    dst='yellow_tripdata/',
-    bucket=BUCKET_NAME,
-    dag=dag,
-)
-
-# Task to create external table
-create_external_table_task = PythonOperator(
-    task_id='create_external_table',
-    python_callable=create_external_table,
-    dag=dag,
-)
-
-# Task to create optimized table
-create_optimized_table_task = PythonOperator(
-    task_id='create_optimized_table',
-    python_callable=create_optimized_table,
-    dag=dag,
-)
-
-# Define task dependencies
-download_task >> preprocess_task >> upload_to_gcs_task >> create_external_table_task >> create_optimized_table_task
+    (
+        download_task
+        >> upload_to_gcs_task
+        >> create_external_table_task
+        >> create_optimized_table_task
+        >> cleanup_task
+    )

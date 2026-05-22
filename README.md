@@ -111,8 +111,8 @@ The architecture consists of:
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/faketut/NYC-Taxi-Data-Pipeline-MVP.git
-cd nyc-taxi-pipeline
+git clone https://github.com/faketut/CabStream-ETL.git
+cd CabStream-ETL
 ```
 
 ### 2. Set up GCP
@@ -141,19 +141,17 @@ export GCP_REGION=us-central1
 ### 3. Deploy Infrastructure with Terraform
 
 ```bash
-cd terraform
+cd nyc_taxi_pipeline/terraform
 
-# Edit variables.tf to update project_id and region if needed
+# Initialize remote state (point to a pre-created GCS bucket)
+terraform init -backend-config="bucket=<your-tfstate-bucket>"
 
-# Initialize Terraform
-terraform init
-
-# Preview the infrastructure changes
-terraform plan
-
-# Apply the infrastructure changes
-terraform apply
+# Preview / apply (no defaults: project_id and admin_cidr are required)
+terraform plan  -var="project_id=$GCP_PROJECT_ID" -var="admin_cidr=$ADMIN_CIDR"
+terraform apply -var="project_id=$GCP_PROJECT_ID" -var="admin_cidr=$ADMIN_CIDR"
 ```
+
+> `ADMIN_CIDR` should be your own /32 (e.g. `203.0.113.4/32`); the Airflow UI firewall rule only opens :8080 to that range.
 
 Wait for the resources to be created. This will set up:
 - GCS bucket for the data lake
@@ -171,16 +169,16 @@ gcloud compute ssh airflow-instance --project $GCP_PROJECT_ID --zone $GCP_REGION
 Clone the repository on the VM and set up Airflow:
 
 ```bash
-git clone https://github.com/faketut/NYC-Taxi-Data-Pipeline-MVP.git
-cd nyc-taxi-pipeline
+git clone https://github.com/faketut/CabStream-ETL.git
+cd CabStream-ETL
 
 # Initialize Airflow database
 airflow db init
 
-# Create Airflow user
+# Create the admin user. Omit --password so Airflow prompts you interactively;
+# never commit or paste credentials. Rotate immediately after first login.
 airflow users create \
     --username admin \
-    --password admin \
     --firstname Admin \
     --lastname User \
     --role Admin \
@@ -188,7 +186,7 @@ airflow users create \
 
 # Copy DAGs to Airflow dags folder
 mkdir -p ~/airflow/dags
-cp -r airflow/dags/* ~/airflow/dags/
+cp nyc_taxi_pipeline/airflow/nyc_taxi_pipeline.py ~/airflow/dags/
 
 # Start Airflow webserver and scheduler
 airflow webserver -D
@@ -249,25 +247,31 @@ The pipeline will:
 ## Project Structure
 
 ```
-nyc_taxi_pipeline/
-├── terraform/               # IaC for cloud resources
-│   ├── main.tf              # Main Terraform configuration
-│   └── variables.tf         # Terraform variables
-├── airflow/                 # DAGs for orchestration
-│   └── dags/
-│       └── nyc_taxi_pipeline.py  # Main DAG file
-├── dbt/                     # Transformations
-│   ├── models/
-│   │   ├── schema.yml           # dbt schema definitions
-│   │   ├── dim_datetime.sql     # Datetime dimension
-│   │   ├── dim_zones.sql        # Zones dimension
-│   │   ├── fact_trips.sql       # Trips fact table
-│   │   ├── mart_daily_trips.sql    # Daily aggregation
-│   │   ├── mart_location_trips.sql # Location aggregation
-│   │   └── mart_hourly_trips.sql   # Hourly aggregation
-│   └── profiles.yml         # dbt connection profiles
-├── scripts/                 # Utility scripts
-└── README.md                # Documentation
+CabStream-ETL/
+├── README.md
+├── requirements.txt              # Pinned Python deps for the Airflow VM
+├── setup_gcp_helper.sh           # Convenience wrapper around terraform init/plan/apply
+├── .github/workflows/ci.yml      # Lint + test + terraform validate
+└── nyc_taxi_pipeline/
+    ├── terraform/
+    │   ├── main.tf               # GCS bucket, BQ dataset, VM, SA, firewall
+    │   └── variables.tf
+    ├── airflow/
+    │   ├── nyc_taxi_pipeline.py  # Ingestion DAG
+    │   └── test_dag_logic.py     # Unit tests for DAG callables
+    └── dbt/
+        ├── dbt_project.yml
+        ├── profiles.yml
+        ├── seeds/
+        │   └── taxi_zone_lookup.csv
+        └── models/
+            ├── schema.yml
+            ├── dim_datetime.sql
+            ├── dim_zones.sql
+            ├── fact_trips.sql
+            ├── mart_daily_trips.sql
+            ├── mart_hourly_trips.sql
+            └── mart_location_trips.sql
 ```
 
 ## Evaluation Criteria Addressed

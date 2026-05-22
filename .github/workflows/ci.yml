@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install ruff pytest pandas pyarrow requests
+      - run: ruff check nyc_taxi_pipeline/airflow
+      - run: pytest nyc_taxi_pipeline/airflow
+
+  dbt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install "dbt-bigquery>=1.7,<1.9"
+      - name: dbt parse
+        working-directory: nyc_taxi_pipeline/dbt
+        env:
+          GCP_PROJECT_ID: ci-placeholder
+          GCP_REGION: us-central1
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/empty.json
+        run: |
+          echo '{}' > /tmp/empty.json
+          dbt parse --no-version-check
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=nyc_taxi_pipeline/terraform fmt -check
+      - run: terraform -chdir=nyc_taxi_pipeline/terraform init -backend=false
+      - run: terraform -chdir=nyc_taxi_pipeline/terraform validate

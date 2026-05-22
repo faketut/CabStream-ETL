@@ -1,0 +1,7 @@
+apache-airflow==2.9.3
+apache-airflow-providers-google==10.20.0
+google-cloud-storage
+google-cloud-bigquery
+pandas
+pyarrow
+requests
